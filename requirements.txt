@@ -1,0 +1,3 @@
+boto3
+fabric
+git+git://github.com/martinfarrow/fluentWrap.git@v0.3
