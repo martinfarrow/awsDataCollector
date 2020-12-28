@@ -12,12 +12,7 @@ import logging
 import os
 import sys
 import importlib.util
-#import fluentWrap as fl
-spec = importlib.util.spec_from_file_location("fluentWrap", 
-                                              "/Users/martin/VCdev/fluentWrap/fluentWrap.py")
-
-fl = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(fl)
+import fluentWrap as fl
 
 # needed for exception handling on fabric connections
 
