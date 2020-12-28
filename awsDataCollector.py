@@ -11,7 +11,13 @@ import re
 import logging 
 import os
 import sys
-import fluentWrap as fl
+import importlib.util
+#import fluentWrap as fl
+spec = importlib.util.spec_from_file_location("fluentWrap", 
+                                              "/Users/martin/VCdev/fluentWrap/fluentWrap.py")
+
+fl = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fl)
 
 # needed for exception handling on fabric connections
 
@@ -20,6 +26,141 @@ import socket
 import paramiko
 
 MAX_NUM_THROTTLE_RETRIES = 16
+
+
+class autoPaginator():
+    """Auto paginates calls to boto3 client objects and allows iteration"""
+
+    def __init__(self, client, index=None, fluentWrap=False):
+        self.client = client
+        self.NextToken = ""
+        self.response = None
+        self.index = index
+        self.fluentWrap = fluentWrap
+
+    def data(self):
+        if self.index is not None:
+            if self.index in self.response:
+                data = self.response[self.index]
+            else:
+                data = []
+        else:
+            data = self.response
+
+        return  fl.fluentWrap(data) if self.fluentWrap else data
+
+    def __iter__(self):
+        return self.autoPaginator_iter(self)
+
+    def get(self):
+        self.response = self.client(self.NextToken)
+        if 'NextToken' in self.response:
+            self.NextToken = self.response['NextToken']
+            return True
+        else:
+            return False
+
+    class autoPaginator_iter():
+
+        def __init__(self, ap):
+            self.ap = ap
+            self.there_is_more = True
+
+        def __next__(self):
+            if (self.there_is_more):
+                self.there_is_more = self.ap.get()
+                return self.ap.data()
+            else:
+                raise StopIteration
+
+class awsPrice():
+    def __init__(self, service, session, log):
+        self.session = session
+        self.log = log
+        self.service = service
+        self.filterList = list()
+        my_retry_config = botocore.config.Config(retries={'max_attempts': MAX_NUM_THROTTLE_RETRIES})
+        self.pricing = session.client('pricing', region_name='us-east-1', config=my_retry_config)
+
+    def setFilter(self, filter):
+        self.filterList = list()
+        for key in filter:
+            self.filterList.append(
+                    { 'Type': 'TERM_MATCH',
+                      'Field': key,
+                      'Value': filter[key] })
+
+    def getPrices(self, noTreat=False):
+        """Grab the pricelist using the supplied filter list"""
+
+        client = lambda x: self.pricing.get_products(ServiceCode=self.service,
+                                                     Filters=self.filterList,
+                                                     FormatVersion='aws_v1',
+                                                     NextToken=x)
+        
+        ap = autoPaginator(client, index='PriceList', fluentWrap = False)
+
+        priceList = list()
+
+        # amazingly the returned values are string encased json, so here
+        # we unpack it - this looks like it comes from SAP to me but I
+        # could be wrong
+
+        for priceListData in ap:
+            for item in priceListData:
+                r = json.loads(item)
+                priceList.append(r)
+
+        self.prices = fl.fluentWrap(priceList)
+        if noTreat:
+            return
+
+        self.__treatPrices()
+        
+    def __treatPrices(self):
+        """Clean up the mess of the pricing structure, specifically in areas we currently need"""
+
+        # .terms.OnDemand has multiple-cost codes as attributes
+        # this moves the attributed name in to the attribute fluentWrap
+        # structure and then makes the structure more usable by making
+        # it iterable (as an encased list), finally removing the
+        # original cost-code attributes
+        #
+        # The problem we solve here is (1) we don't know the cost
+        # code attribute name until we process it and (2) the cost
+        # code has periods (.) in it, which makes it usless in a
+        # fluent converted solution.
+
+        for item in self.prices:
+            if not item.checkPath('terms.OnDemand'):
+                continue
+            codes = item.terms.OnDemand.getKeys()
+            for code in codes:
+                value = item.terms.OnDemand.getKey(code)
+                value.code = code
+
+                # the priceDimension attributes have the same problem.
+                # Again move attrbutes into an encased list to make
+                # the data usable
+
+                pdKeys = value.priceDimensions.getKeys()
+                for pdKey in pdKeys:
+                    pdSpec = value.priceDimensions.getKey(pdKey)
+                    pdSpec.code = pdKey
+                    value.priceDimensions.append(pdSpec)
+
+                # delete the keys since we moved them into a single list
+
+                for pdKey in pdKeys:
+                    value.priceDimensions.deleteKey(pdKey)
+
+                item.terms.OnDemand.append(value)
+
+            # delete the keys since we moved them into a single list
+
+            for code in codes:
+                item.terms.OnDemand.deleteKey(code)
+                
 
 class awsDataCollector(Exception):
     pass
@@ -32,26 +173,47 @@ class awsDataCollector():
         my_retry_config = botocore.config.Config(retries={'max_attempts': MAX_NUM_THROTTLE_RETRIES})
 
         # boto3 connectors, clients and resources
+        self.session = session
         self.ec2 = session.resource('ec2', config=my_retry_config)
         self.asg = boto3.client('autoscaling', config=my_retry_config)
         self.ec2Client = session.client('ec2', config=my_retry_config)
         self.r53 = boto3.client('route53', config=my_retry_config)
         self.ssm = boto3.client('ssm', config=my_retry_config)
         self.elasticache = boto3.client('elasticache', config=my_retry_config)
+        self.pricing = session.client('pricing', region_name='us-east-1', config=my_retry_config)
+        self.rds = session.client('rds', config=my_retry_config)
+
+        # rds instances
+
+        self.db = dict()
+
+        # pricing
+
+        self.spotHistory = dict()
+        self.services = fl.fluentWrap()
+
+        # price caches
+
+        self.ec2Prices = dict()
+        self.RDSPrices = dict()
 
         # hosted zone management
+
         self.dns = dict()
 
         # resource records
+
         self.rr = dict()
         self.ipRRCrossRef=dict()
 
         # ec2 hosts management
+
         self.ec2hosts = dict()
         self.ec2hostsById = dict()
         self.instanceCount = dict()
 
         # ec2 rr cross referencing
+
         self.ipHostPriv = dict()
         self.ipHostPub = dict()
         self.hostVpc = dict()
@@ -115,6 +277,32 @@ class awsDataCollector():
         self.build_env = build_env
         self.asgRe = re.compile(r'^{}'.format(self.build_env))
 
+    def getSpotPrice(self):
+        response=self.ec2Client.describe_spot_price_history(InstanceTypes=['t3.small'],
+                                                          MaxResults=100,
+                                                          ProductDescriptions=['Linux/UNIX'],
+                                                          AvailabilityZone='eu-west-2c')
+        self.spotHistory = fl.fluentWrap(response['SpotPriceHistory'])
+
+    def getServices(self, serviceCodes=[]):
+        """Get amazon service information"""
+        #boto3.set_stream_logger('botocore', 10)
+        serviceCodes = list(serviceCodes)
+        self.services = fl.fluentWrap()
+
+        if len(serviceCodes) == 0:
+            serviceCodes.append("")
+
+        for serviceCode in serviceCodes:
+            client = lambda x: self.pricing.describe_services(
+                                                FormatVersion='aws_v1',
+                                                MaxResults=100,
+                                                ServiceCode=serviceCode,
+                                                NextToken=x)
+            ap = autoPaginator(client, index='Services', fluentWrap=True)
+            for service in ap:
+                self.services += service
+
     def getLoadBalancers(self):
         response = self.elbv2.describe_load_balancers()
         self.v2lbs = fl.fluentWrap(response['LoadBalancers'])
@@ -168,6 +356,10 @@ class awsDataCollector():
         asg = [asg for asg in self.deployAsgs if asg.name == name]
         return asg[0] if len(asg) > 0 else None
 
+    def getSgByName(self, name):
+        sg = [ sg for sg in self.sgs if sg.GroupName == name]
+        return sg[0] if len(sg) > 0 else None
+
     def getLaunchConfig(self, asg):
         response = self.asg.describe_launch_configurations(
                     LaunchConfigurationNames=[asg.LaunchConfigurationName])
@@ -175,7 +367,14 @@ class awsDataCollector():
             return fl.fluentWrap(response['LaunchConfigurations'])
         return None
 
-    def collectInstanceData(self, collectRdns=False):
+    #def getInstanceData(self):
+    #    client = lambda x: self.ec2Client.describe_instances(Filters=[{'Name': 'tag:Name', 'Values': [ '{}*'.format(self.build_env)]}], NextToken=x)
+    #    ap = autoPaginator(client, 'Reservations', fluentWrap = True )
+    #    self.inst = fl.fluentWrap([])
+    #    for resv in ap:
+    #        self.inst += resv
+
+    def collectInstanceData(self, collectRdns=False, getPrice=False):
         """Collect instance data for the configured filter, and create the e2hosts attribute"""
 
         try:
@@ -195,7 +394,15 @@ class awsDataCollector():
                 self.instanceCount[tagHostName] = self.instanceCount[tagHostName] + 1
 
             upSeconds = self.upTime(instance.launch_time)
-            id2name[instance.id]={ "name": tagHostName, "instance": instance, 'running': running, 'uptime': upSeconds, 'connection': None}
+            if (getPrice):
+                if (running):
+                    price = self.getEC2Price(instance.instance_type)
+                else:
+                    price = 0
+            else:
+                price = 0
+
+            id2name[instance.id]={ "name": tagHostName, "instance": instance, 'running': running, 'uptime': upSeconds, 'price': price, 'connection': None}
 
         # remove zeros, so we don't get name-0 extensions
 
@@ -215,7 +422,59 @@ class awsDataCollector():
             self.collectRdnsHostData()
 
         return
+
+    def getRDSPrice(self, instanceType, engine, multiAZ):
+        """get the price for the specified RDS instance"""
+
+        deployment = 'Multi-AZ' if multiAZ else 'Single-AZ' 
+
+        idstring = instanceType+":"+engine+":"+deployment
+        idstring = idstring.lower()
+
+        if idstring not in self.RDSPrices:
+
+            pricer = awsPrice('AmazonRDS', self.session, self.log)
+            # TODO: note big assumptions on query filter
+            filters = { 'Location': 'EU (London)',
+                        'instanceType': instanceType,
+                        'databaseEngine': engine,
+                        'deploymentOption': 'Multi-AZ' if multiAZ else 'Single-AZ' 
+                       }
+            pricer.setFilter(filters)
+            pricer.getPrices()
+            if (pricer.prices.len() > 0):
+                # obvious ! - it's like they don't want you to be able to find it !
+                self.RDSPrices[idstring] =  float(pricer.prices.get(0).terms.OnDemand.get(0).priceDimensions.get(0).pricePerUnit.USD)
+            else:
+                self.RDSPrices[idstring] = 0.00
+
+        return self.RDSPrices[idstring]
+
+
+    def getEC2Price(self, instanceType):
+        """Get the price for the instance type"""
+        if instanceType not in self.ec2Prices:
+
+            pricer = awsPrice('AmazonEC2', self.session, self.log)
+            # TODO: note big assumptions on query filter
+            filters = { 
+                        'Location': 'EU (London)',
+                        'instanceType': instanceType,
+                        'operatingSystem': 'Linux',
+                        'preinstalledsw': 'NA',
+                        'capacitystatus': 'used',
+                        'tenancy': 'shared'
+                       }
+            pricer.setFilter(filters)
+            pricer.getPrices()
+            if (pricer.prices.len() > 0):
+                # obvious ! - it's like they don't want you to be able to find it !
+                self.ec2Prices[instanceType] =  float(pricer.prices.get(0).terms.OnDemand.get(0).priceDimensions.get(0).pricePerUnit.USD)
+            else:
+                self.ec2Prices[instanceType] =  0.00
     
+        return self.ec2Prices[instanceType]
+
     def upTime(self, launch_time):
         """ Gets the time between now and launch time in seconds"""
         lt_datetime = dp.parse(str(launch_time))
@@ -268,6 +527,16 @@ class awsDataCollector():
         for hz in self.dns:
             if hz.Config.PrivateZone is False:
                 self.getRecordSets(hz.Id)
+
+    def getRDSinstances(self, cost=False):
+        response = self.rds.describe_db_instances()
+        self.db = fl.fluentWrap(response['DBInstances'])
+
+        if cost:
+            for db in self.db:
+                db.price = self.getRDSPrice(db.DBInstanceClass,
+                                            db.Engine,
+                                            db.MultiAZ)
 
 
     def getHosts(self, running):
