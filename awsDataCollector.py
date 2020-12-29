@@ -524,7 +524,12 @@ class awsDataCollector():
                 self.getRecordSets(hz.Id)
 
     def getRDSinstances(self, cost=False):
-        response = self.rds.describe_db_instances()
+        if self.build_env is None:
+            response = self.rds.describe_db_instances()
+        else:
+            filter = [{ 'Name': 'db-instance-identifier', 'Values': ['{}*'.format(self.build_env)]}]
+            response = self.rds.describe_db_instances(Filters=filter)
+
         self.db = fl.fluentWrap(response['DBInstances'])
 
         if cost:
