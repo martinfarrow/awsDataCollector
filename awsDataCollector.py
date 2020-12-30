@@ -267,10 +267,15 @@ class awsDataCollector():
         self.sgs = dict()
         self.sgsByGroudId = dict()
 
+        # elastic cache
+        self.cacheClusters = fl.fluentWrap()
+        self.replicationGroups = fl.fluentWrap()
+
 
     def setBuildEnv(self, build_env):
         self.build_env = build_env
         self.asgRe = re.compile(r'^{}'.format(self.build_env))
+        self.rdsRe = re.compile(r'^{}'.format(self.build_env))
 
     def getSpotPrice(self):
         response=self.ec2Client.describe_spot_price_history(InstanceTypes=['t3.small'],
@@ -305,9 +310,13 @@ class awsDataCollector():
         response = self.elb.describe_load_balancers()
         self.lbs = fl.fluentWrap(response['LoadBalancerDescriptions'])
 
+    def getCacheClusters(self):
+        response = self.elasticache.describe_cache_clusters()
+        self.cacheClusters = fl.fluentWrap(response['CacheClusters'])
+
     def getRedisReplGroups(self):
         response = self.elasticache.describe_replication_groups()
-        self.redis = fl.fluentWrap(response['ReplicationGroups'])
+        self.replicationGroups = fl.fluentWrap(response['ReplicationGroups'])
 
     def getHostedZones(self):
         response = self.r53.list_hosted_zones()
@@ -524,13 +533,17 @@ class awsDataCollector():
                 self.getRecordSets(hz.Id)
 
     def getRDSinstances(self, cost=False):
-        if self.build_env is None:
-            response = self.rds.describe_db_instances()
-        else:
-            filter = [{ 'Name': 'db-instance-id', 'Values': ['{}*'.format(self.build_env)]}]
-            response = self.rds.describe_db_instances(Filters=filter)
 
-        self.db = fl.fluentWrap(response['DBInstances'])
+        response = self.rds.describe_db_instances()
+        db = fl.fluentWrap(response['DBInstances'])
+
+        if self.build_env is not None:
+            self.db = fl.fluentWrap()
+            for procDb in db:
+                if self.rdsRe.match(procDb.DBInstanceIdentifier):
+                    self.db.append(procDb)
+        else:
+            self.db = db
 
         if cost:
             for db in self.db:
