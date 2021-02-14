@@ -717,11 +717,11 @@ class awsDataCollector():
                 self.config = json.load(fp)
         except IOError as e:
             errno, strerror = e.args
-            self.log.error("Unable to open {}: errno({}): {}",format(filepath, errno, strerror))
+            self.log.error("Unable to open {}: errno({}): {}".format(filepath, errno, strerror))
             return
         except OSError as e:
             errno, strerror = e.args
-            self.log.error("Error opening file {}: errno({}): {}",format(filepath, errno, strerror))
+            self.log.error("Error opening file {}: errno({}): {}".format(filepath, errno, strerror))
             return
             
         try:
