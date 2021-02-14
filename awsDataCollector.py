@@ -719,6 +719,11 @@ class awsDataCollector():
             errno, strerror = e.args
             self.log.error("Unable to open {}: errno({}): {}",format(errno, strerror))
             return
+        except FileNotFoundError as e:
+            errno, strerror = e.args
+            self.log.error("File does not exist {}: errno({}): {}",format(errno, strerror))
+            return
+            
         try:
             self.parseConfig()
         except awsDataCollectorException as exc:

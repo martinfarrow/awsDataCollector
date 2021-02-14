@@ -2,6 +2,9 @@
 
 ## [vnext]
 
+## v0.3.1 - 2021-02-14
+- Fixed problem of stack trace when config file was missing
+
 ## v0.3 - 2021-02-14
 - Staring change log tracking
 - updated autoPaginator to allow for various aws nexttokens
