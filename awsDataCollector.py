@@ -26,12 +26,13 @@ MAX_NUM_THROTTLE_RETRIES = 16
 class autoPaginator():
     """Auto paginates calls to boto3 client objects and allows iteration"""
 
-    def __init__(self, client, index=None, fluentWrap=False):
+    def __init__(self, client, index=None, fluentWrap=False, apMarker='NextToken'):
         self.client = client
         self.NextToken = ""
         self.response = None
         self.index = index
         self.fluentWrap = fluentWrap
+        self.apMarker = apMarker
 
     def data(self):
         if self.index is not None:
@@ -49,8 +50,8 @@ class autoPaginator():
 
     def get(self):
         self.response = self.client(self.NextToken)
-        if 'NextToken' in self.response:
-            self.NextToken = self.response['NextToken']
+        if self.apMarker in self.response:
+            self.NextToken = self.response[self.apMarker]
             return True
         else:
             return False
@@ -157,13 +158,13 @@ class awsPrice():
                 item.terms.OnDemand.deleteKey(code)
                 
 
-class awsDataCollector(Exception):
+class awsDataCollectorException(Exception):
     pass
 
 class awsDataCollector():
     """Collects related information about common aws artefacts"""
 
-    def __init__(self, session, log, build_env=None):
+    def __init__(self, session, log, filter=None):
         self.log = log
         my_retry_config = botocore.config.Config(retries={'max_attempts': MAX_NUM_THROTTLE_RETRIES})
 
@@ -177,6 +178,7 @@ class awsDataCollector():
         self.elasticache = boto3.client('elasticache', config=my_retry_config)
         self.pricing = session.client('pricing', region_name='us-east-1', config=my_retry_config)
         self.rds = session.client('rds', config=my_retry_config)
+        self.sts = boto3.client('sts', config=my_retry_config)
 
         # rds instances
 
@@ -206,6 +208,7 @@ class awsDataCollector():
         self.ec2hosts = dict()
         self.ec2hostsById = dict()
         self.instanceCount = dict()
+        self.instances = list()
 
         # ec2 rr cross referencing
 
@@ -222,8 +225,10 @@ class awsDataCollector():
         self.jumpPrivKeyFile = None
         self.ec2PrivKeyFile = None
 
-        if (build_env is not None):
-            self.setBuildEnv(build_env)
+        if (filter is not None):
+            self.setFilter(filter)
+        else:
+            self.filter = None
 
         # asg variables
 
@@ -248,8 +253,11 @@ class awsDataCollector():
 
         self.elbv2 = boto3.client('elbv2', config=my_retry_config)
         self.elb = boto3.client('elb', config=my_retry_config)
-        self.v2lbs = None
-        self.lbs = None
+        self.v2lbs = fl.fluentWrap()
+        self.lbs = fl.fluentWrap()
+        self.lbsByArn = dict()
+
+        self.tgs = fl.fluentWrap()
 
         # vpc info
 
@@ -271,11 +279,20 @@ class awsDataCollector():
         self.cacheClusters = fl.fluentWrap()
         self.replicationGroups = fl.fluentWrap()
 
+        # ami 
+        self.ami = fl.fluentWrap()
 
-    def setBuildEnv(self, build_env):
-        self.build_env = build_env
-        self.asgRe = re.compile(r'^{}'.format(self.build_env))
-        self.rdsRe = re.compile(r'^{}'.format(self.build_env))
+        # volumes
+
+        self.volumes = fl.fluentWrap()
+
+        # snapshots
+
+        self.snapshots = fl.fluentWrap()
+
+    def setFilter(self, filter):
+        self.filter = filter
+        self.filterRe = re.compile(r'^{}'.format(self.filter))
 
     def getSpotPrice(self):
         response=self.ec2Client.describe_spot_price_history(InstanceTypes=['t3.small'],
@@ -303,39 +320,143 @@ class awsDataCollector():
             for service in ap:
                 self.services += service
 
+    def getVolumes(self):
+        """collects information on all volumes in the account"""
+        client = lambda x: self.ec2Client.describe_volumes(NextToken=x)
+        ap = autoPaginator(client, index='Volumes', fluentWrap=True)
+        instances = list()
+        for vs in ap:
+            self.volumes += vs
+            for vol in vs:
+                for att in vol.Attachments:
+                    instances.append(att.InstanceId)
+
+        self.instances = self.ec2.instances.filter(InstanceIds=instances)
+        self.getInstanceData(self)
+
+    def getSnapshots(self, accountIds=list(), thisAccount=False):
+        accIds = list()
+        if thisAccount:
+            accountId = self.sts.get_caller_identity().get('Account')
+            accIds = [ accountId ]
+        else:
+            if len(accountIds) > 0:
+                accIds = accountIds
+
+        if len(accIds) == 0:
+            client = lambda x: self.ec2Client.describe_snapshots(NextToken=x)
+        else:
+            client = lambda x: self.ec2Client.describe_snapshots(OwnerIds=[ accountId ],
+                                                             NextToken=x)
+        ap = autoPaginator(client, index='Snapshots', fluentWrap=True)
+        for ssg in ap:
+            self.snapshots += ssg
+
+
     def getLoadBalancers(self):
         response = self.elbv2.describe_load_balancers()
-        self.v2lbs = fl.fluentWrap(response['LoadBalancers'])
+        v2lbs = fl.fluentWrap(response['LoadBalancers'])
+        self.v2lbs = fl.fluentWrap()
+
+        if self.filter is not None:
+            for lbs in v2lbs:
+                if self.filterRe.match(lbs.LoadBalancerName):
+                    self.v2lbs.append(lbs)
+        else:
+            self.v2lbs = v2lbs
 
         response = self.elb.describe_load_balancers()
-        self.lbs = fl.fluentWrap(response['LoadBalancerDescriptions'])
+
+        lbs = fl.fluentWrap(response['LoadBalancerDescriptions'])
+        self.lbs = fl.fluentWrap()
+
+        # adjust by adding a Type so we can recognise legacy lbs
+
+        if self.filter is not None:
+            for lbs in lbs:
+                if self.filterRe.match(lbs.LoadBalancerName):
+                    lbs.Type = "Legacy"
+                    self.lbs.append(lbs)
+        else:
+            for lbs in lbs:
+                lbs.Type = "Legacy"
+                self.lbs.append(lbs)
+
+        # make a cross reference
+
+        for lbs in self.v2lbs + self.lbs:
+            if lbs.LoadBalancerArn not in self.lbsByArn:
+                self.lbsByArn[lbs.LoadBalancerArn] = fl.fluentWrap()
+                self.lbsByArn[lbs.LoadBalancerArn].targetGroups = fl.fluentWrap()
+
+            self.lbsByArn[lbs.LoadBalancerArn].loadBalancer = lbs
+
+    def getTargetGroups(self):
+        client = lambda x: self.elbv2.describe_target_groups(Marker=x)
+        ap = autoPaginator(client, index='TargetGroups', fluentWrap=True, apMarker='Marker')
+        for tgs in ap:
+            self.tgs += tgs
+
+            # cross reference 
+
+            for tg in tgs:
+                for lbarn in tg.LoadBalancerArns:
+                    if lbarn not in self.lbsByArn:
+                        self.lbsByArn[lbarn] = fl.fluentWrap()
+                        self.lbsByArn[lbarn].targetGroups = fl.fluentWrap()
+                    
+                    self.lbsByArn[lbarn].targetGroups.append(tg)
+        
+    def getTargetGroupHealth(self):
+        for lbs in self.lbsByArn:
+            for tg in lbs.targetGroups:
+                response = self.elbv2.describe_target_health(TargetGroupArn=tg.TargetGroupArn)
+                if 'TargetHealthDescriptions' in response:
+                    tg.HealthDescription = fl.fluentWrap(response['TargetHealthDescriptions'])
 
     def getCacheClusters(self):
         response = self.elasticache.describe_cache_clusters()
-        self.cacheClusters = fl.fluentWrap(response['CacheClusters'])
+        cacheClusters = fl.fluentWrap(response['CacheClusters'])
+        self.cacheClusters = fl.fluentWrap()
+
+        if self.filter is not None:
+            for cc in cacheClusters:
+                if self.filterRe.match(cc.CacheClusterId):
+                    self.cacheClusters.append(cc)
+        else:
+            self.cacheClusters = cacheClusters
 
     def getRedisReplGroups(self):
         response = self.elasticache.describe_replication_groups()
-        self.replicationGroups = fl.fluentWrap(response['ReplicationGroups'])
+        replicationGroups = fl.fluentWrap(response['ReplicationGroups'])
+
+        if self.filter is not None:
+            for rg in replicationGroups:
+                if self.filterRe.match(rg.ReplicationGroupId):
+                    self.replicationGroups.append(rg)
+        else:
+            self.replicationGroups = replicationGroups
 
     def getHostedZones(self):
         response = self.r53.list_hosted_zones()
         self.dns = fl.fluentWrap(response['HostedZones'])
 
-    def getAMIData(self):
+    def getAMIData(self, filterText=["ami-*"]):
         # centos account 125523088429
         # amazonlinux-2-base_1579686771 2020-01-22T10:00:28.000Z ami-00b8d754e256a1884 766535289950
         #images = self.ec2Client.describe_images(Owners=['self'])
-        fltr = [{'Name': 'name', 'Values': [ 'ami-*' ]}]
-        #images = self.ec2Client.describe_images(Filters=fltr)
-        images = self.ec2Client.describe_images()
-        flimages = fl.fluentWrap(images['Images'])
-        for lami in flimages:
-            print("{} {} {} {} - {}".format(lami.Name,
-                                         lami.CreationDate,
-                                         lami.ImageId,
-                                         lami.OwnerId,
-                                         lami.Description))
+        #fltr = [{'Name': 'name', 'Values': [ 'ami-*' ]}]
+        fltr = [{'Name': 'name', 'Values': filterText}]
+        response = self.ec2Client.describe_images(Filters=fltr)
+        self.ami = fl.fluentWrap(response['Images'])
+        #images = self.ec2Client.describe_images()
+        #flimages = fl.fluentWrap(images['Images'])
+        #for lami in flimages:
+        #    print("{} {} {} {} - {}".format(lami.Name,
+        #                                 lami.CreationDate,
+        #                                 lami.ImageId,
+        #                                 lami.OwnerId,
+        #                                 lami.Description))
 
     def collectAsgData(self):
         """Collect information about auto-scaling-groups"""
@@ -348,7 +469,7 @@ class awsDataCollector():
         self.deployAsgs=dict()
         for asg in self.allAsgs:
             asg.name = self.getNameTag(asg.Tags)
-            if self.asgRe.match(asg.name):
+            if self.filterRe.match(asg.name):
                 asg.LaunchConfiguration = self.getLaunchConfig(asg)
                 self.deployAsgs[asg.name] = asg
         self.deployAsgs = fl.fluentWrap(self.deployAsgs)
@@ -381,12 +502,21 @@ class awsDataCollector():
     def collectInstanceData(self, collectRdns=False, getPrice=False):
         """Collect instance data for the configured filter, and create the e2hosts attribute"""
 
-        try:
-            instances = self.ec2.instances.filter(Filters=[{'Name': 'tag:Name', 'Values': [ '{}*'.format(self.build_env)]}])
-        except Exception as e:
-            print(f"Error", e)
-            raise
+        if (self.filter is not None):
+            try:
+                instances = self.ec2.instances.filter(Filters=[{'Name': 'tag:Name', 'Values': [ '{}*'.format(self.filter)]}])
+            except Exception as e:
+                print(f"Error", e)
+                raise
+        else:
+            instances = self.ec2.instances.all()
 
+        self.instances = instances
+        self.getInstanceData(collectRdns, getPrice)
+
+    def getInstanceData(self, collectRdns=False, getPrice=False):
+
+        instances = self.instances
         self.instanceCount = dict()
         id2name = dict()
         for instance in instances:
@@ -486,7 +616,11 @@ class awsDataCollector():
         return int(lt_delta.total_seconds())
 
     def getSecurityGroups(self):
-        response = self.ec2Client.describe_security_groups(Filters=[{'Name': 'tag:Name', 'Values': [ '{}*'.format(self.build_env) ]}])
+        if (self.filter is not None):
+            response = self.ec2Client.describe_security_groups(Filters=[{'Name': 'tag:Name', 'Values': [ '{}*'.format(self.filter) ]}])
+        else:
+            response = self.ec2Client.describe_security_groups()
+
         self.sgs = fl.fluentWrap(response['SecurityGroups'])
         self.sgsByGroupId = dict()
         for sg in self.sgs:
@@ -537,10 +671,10 @@ class awsDataCollector():
         response = self.rds.describe_db_instances()
         db = fl.fluentWrap(response['DBInstances'])
 
-        if self.build_env is not None:
+        if self.filter is not None:
             self.db = fl.fluentWrap()
             for procDb in db:
-                if self.rdsRe.match(procDb.DBInstanceIdentifier):
+                if self.filterRe.match(procDb.DBInstanceIdentifier):
                     self.db.append(procDb)
         else:
             self.db = db
@@ -587,7 +721,7 @@ class awsDataCollector():
             return
         try:
             self.parseConfig()
-        except awsDataCollector as exc:
+        except awsDataCollectorException as exc:
             self.log.error(exc)
             sys.exit(1)
 
@@ -606,7 +740,7 @@ class awsDataCollector():
 
         for build_env in self.config.keys():
 
-            if re.match('^{}'.format(build_env), self.build_env):
+            if re.match('^{}'.format(build_env), self.filter):
                 config=self.config[build_env]
                 for feature in [ 'IdentityFile', 'ProxyMatch', 'ProxyHost', "ec2user" ]:
                     if feature in config:
@@ -630,7 +764,7 @@ class awsDataCollector():
                     self.log.warning("No defintion for ec2user has been found, no user line will be added to ssh config")
                 return
                 break
-        raise awsDataCollector("No definition for defined build_env ({}) was found in config file".format(self.build_env))
+        raise awsDataCollectorException("No definition for defined build_env ({}) was found in config file".format(self.filter))
         return
 
     def buildConnections(self, debug=False):
@@ -725,6 +859,25 @@ class awsDataCollector():
             if (images):
                 rresponse = self.ecr.list_images(repositoryName=repo.repositoryName)
                 repo.imageIds = fl.fluentWrap(rresponse['imageIds'])
+                imageIds=list()
+                for image in repo.imageIds:
+                    if image.checkPath("imageTag"):
+                        imageIds.append({ 'imageTag': image.imageTag })
+                    else:
+                        imageIds.append({ 'imageDigest': image.imageDigest })
+
+                
+                idetresp = self.ecr.describe_images(repositoryName=repo.repositoryName,
+                                                    imageIds=imageIds)
+                if ('imageDetails' in idetresp):
+                    imageDetails=fl.fluentWrap(idetresp['imageDetails'])
+                    for image in repo.imageIds:
+                        for candImage in imageDetails:
+                            if candImage.imageDigest == image.imageDigest:
+                                image = image + candImage
+                                break
+                else:
+                    image.imageDetails=fl.fluentWrap([])
             else:
                 repo.imageIds = fl.fluentWrap([])
 
