@@ -832,6 +832,9 @@ class awsDataCollector():
             else:
                 gateway = jumpCon
 
+            if self.IdentifyFile is None:
+                continue
+
             connection = fabric.Connection(host=ip,
                                            user = self.ec2user,
                                            connect_kwargs = {"key_filename": os.path.expanduser(self.IdentityFile)},
