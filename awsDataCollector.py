@@ -832,7 +832,7 @@ class awsDataCollector():
             else:
                 gateway = jumpCon
 
-            if self.IdentifyFile is None:
+            if self.IdentityFile is None:
                 continue
 
             connection = fabric.Connection(host=ip,
